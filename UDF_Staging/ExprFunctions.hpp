@@ -141,6 +141,12 @@ namespace UDIMPL {
       ss << val;
       return ss.str();
   }
+  template<typename T> inline std::string stringify(T val)
+  {
+      std::ostringstream ss;
+      ss << val;
+      return ss.str();
+  }
 
   inline int write_to_kafka(std::string brokerAddress, std::string topic, std::string key, std::string message, std::string securityProtocol, std::string saslMechanism, std::string saslUsername, std::string saslPassword, std::string sslCALocation)
   {
