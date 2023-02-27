@@ -81,59 +81,7 @@ namespace UDIMPL {
 	  return std::stof(input);
 	}
   /***********************************************************************************/
-  inline std::string int_to_string(int val)
-  {
-      char result[200];
-      sprintf(result, "%d", val);
-      return std::string(result);
-  }
 
-  inline std::string int_to_string(unsigned int val)
-  {
-      char result[200];
-      sprintf(result, "%d", val);
-      return std::string(result);
-  }
-
-  inline std::string int_to_string(long int val)
-  {
-      char result[200];
-      sprintf(result, "%ld", val);
-      return std::string(result);
-  }
-
-  inline std::string int_to_string(long unsigned int val)
-  {
-      char result[200];
-      sprintf(result, "%ld", val);
-      return std::string(result);
-  }
-
-  inline std::string int_to_string(ListAccum<int> val)
-  {
-      std::ostringstream ss;
-      ss << val;
-      return ss.str();
-  }
-
-  inline std::string int_to_string(ListAccum<long> val)
-  {
-      std::ostringstream ss;
-      ss << val;
-      return ss.str();
-  }
-
-  inline std::string bool_to_string(bool val)
-  {
-      return val ? "1" : "0";
-  }
-
-  inline std::string float_to_string(double val)
-  {
-      char result[200];
-      sprintf(result, "%g", val);
-      return std::string(result);
-  }
 
   inline std::string float_to_string(ListAccum<double> val)
   {
@@ -141,7 +89,7 @@ namespace UDIMPL {
       ss << val;
       return ss.str();
   }
-  
+
   template<typename T> inline std::string stringify(T val)
   {
       std::ostringstream ss;
