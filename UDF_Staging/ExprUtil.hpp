@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright (c) 2016, TigerGraph Inc.
+ * Copyright (c) 2023, TigerGraph Inc.
  * All rights reserved.
  * Project: TigerGraph Query Language
  *
@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <gle/engine/cpplib/headers.hpp>
+#include <utility/gutil/glogging.hpp>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -32,8 +33,65 @@
 #include <unistd.h>
 #include <atomic>
 
-typedef std::string string; // XXX DON'T REMOVE
+#include <iostream>
+#include <exception>
+#include <librdkafka/rdkafkacpp.h>
+#include <unordered_set>
 
+/*Added on 03/10/2023 for KafkaUDF*****************************************************/
+class SimpleDeliveryReportCb : public RdKafka::DeliveryReportCb
+{
+public:
+    int error_code;
+    void dr_cb(RdKafka::Message &message)
+    {
+        /* If message.err() is non-zero the message delivery failed permanently
+         * for the message. */
+        if (message.err()) {
+            std::cerr << "% Message delivery failed: " << message.errstr()
+                      << std::endl;
+            error_code = message.err();
+        }
+        else {
+            // std::cerr << "% Message delivered to topic " << message.topic_name()
+            //           << " [" << message.partition() << "] at offset "
+            //           << message.offset() << std::endl;
+            error_code = 0;
+        }
+    }
+};
+/***********************************************************************************/
+/*Added on 06/22/2023 Egress to CEPH S3*********************************************/
+class GlobalStringSet
+{
+public:
+    static size_t count(const std::string& k)
+    {
+        return string_set.count(k);
+    }
+
+    static void insert(const std::string& k)
+    {
+        string_set.insert(k);
+    }
+
+    static size_t erase(const std::string& k)
+    {
+        return string_set.erase(k);
+    }
+
+    static void clear()
+    {
+        string_set.clear();
+    }
+
+private:
+    inline static std::unordered_set<std::string> string_set;
+};
+/***********************************************************************************/
+typedef std::string string;
+
+// XXX DON'T REMOVE
 /*
  * Define structs that used in the functions in "ExprFunctions.hpp"
  * below. For example,
@@ -67,122 +125,30 @@ static const uint32_t SegmentMask = SegmentSize - 1;
 
 struct SegmentCSR {
   // src->tgt adjcent list
-  std::vector<int64_t> adj_list_;
+  std::vector<uint64_t> adj_list_;
   // edges for i:  [offset[i-1]|0 , offset[i])
   // degree for i: offset[i] - offset[i-1]|0
   std::vector<int64_t> offset_list_;
-  SegmentCSR() noexcept = default;
-  SegmentCSR(SegmentCSR &&) noexcept = default;
+  SegmentCSR() = default;
+  SegmentCSR(SegmentCSR &&) = default;
 };
 
 struct WeightedSegmentCSR {
   // src -> <tgt,weight> adjcent list
-  std::vector<std::pair<int64_t, float>> adj_list_;
+  std::vector<std::pair<uint64_t, float>> adj_list_;
   // edges for i:  [offset[i-1]|0 , offset[i])
   // degree for i: offset[i] - offset[i-1]|0
   // weight for i: weight[i]
   std::vector<int64_t> offset_list_;
   std::vector<float> weight_list_;
-  WeightedSegmentCSR() noexcept = default;
-  WeightedSegmentCSR(WeightedSegmentCSR &&) noexcept = default;
+  WeightedSegmentCSR() = default;
+  WeightedSegmentCSR(WeightedSegmentCSR &&) = default;
 };
 
 // Graph/Edge data
 struct Graph {
 public:
-  Graph(size_t segsize)
-      : data_(segsize), wdata_(segsize), max_vids_(segsize),
-        totalSeg_(segsize) {}
-
-  void Initialize(const EngineServiceRequest &request,
-                  const ListAccum<uint64_t> &vertices,
-                  const ListAccum<string> &edge_list) {
-    {
-      uint64_t current =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::system_clock::now().time_since_epoch())
-              .count();
-      std::string rid = request.requestid_.str();
-      std::lock_guard<std::mutex> lock(graph_mutex_);
-      // already initialized
-      if (request.timeout_ts_ == timeout_ && rid == requestid_) {
-	return;
-      }
-      // no query running or previous query timed out
-      if (!running_ || current > timeout_ + 5000) {
-        auto meta = request.GetSegmentMeta();
-        if (!meta)
-          throw std::runtime_error("Segment meta is not ready");
-        timeout_ = request.timeout_ts_;
-        running_ = true;
-        requestid_ = rid;
-        totalSeg_ = meta->size();
-      } else {
-        throw std::runtime_error("Another query running, abort..");
-      }
-    }
-    ResetGraph(totalSeg_);
-    std::cout << "Graph INFO: " << vertices.size() 
-              << " " << edge_list.size() << "\n";    
-    for (auto &v : vertices)
-      Fill(v);
-    for (auto &e : edge_list) {
-      char *end;
-      uint64_t src = std::strtoll(e.c_str(), &end, 10);
-      uint64_t tgt = std::strtoll(end, &end, 10);
-      float weight = std::atof(end);
-      Fill(src, tgt, weight);
-    }
-  }
-
-  void Initialize(const std::string &request,
-                  const ListAccum<uint64_t> &vertices,
-		  const ListAccum<uint64_t> &src,
-		  const ListAccum<uint64_t> &tgt,
-		  const ListAccum<float> &weight) {
-    {
-      char *end;
-      int64_t timeout_ms = std::strtoll(request.c_str(), &end, 10);
-      int64_t segSize = std::strtoll(end, &end, 10);
-      string rid(end + 1, request.size() - (end - request.c_str()));
-
-      uint64_t current =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::system_clock::now().time_since_epoch())
-              .count();
-      std::lock_guard<std::mutex> lock(graph_mutex_);
-      // already initialized
-      if (timeout_ms == timeout_ && rid == requestid_) {
-        return;
-      }
-      // no query running or previous query timed out
-      if (!running_ || current > timeout_ + 5000) {
-        std::cout << "Request INFO: " << request << "\n";             
-        timeout_ = timeout_ms;
-        running_ = true;
-        requestid_ = rid;
-        totalSeg_ = segSize;
-      } else {
-        throw std::runtime_error("Another query running, abort..");
-      }
-    }
-    ResetGraph(totalSeg_);
-    std::cout << "Graph INFO: " << vertices.size()
-              << " " << src.size() 
-	      << " " << tgt.size() 
-	      << " " << weight.size() 
-	      << " " << totalSeg_ << "\n";
-    size_t size = src.size();
-    if (tgt.size() != size || weight.size() != size) {
-      throw std::runtime_error("Edge has inconsistency, abort..");	    
-    }
-    for (auto &v : vertices)
-      Fill(v);
-
-    for (auto i=0; i<size; ++i) {
-      Fill(src.data_[i], tgt.data_[i], weight.data_[i]);
-    }
-  }
+  Graph() {}
 
   void Initialize(const std::string &request,
                   const ListAccum<uint64_t> &vertices,
@@ -193,27 +159,18 @@ public:
       char *end;
       int64_t timeout_ms = std::strtoll(request.c_str(), &end, 10);
       int64_t segSize = std::strtoll(end, &end, 10);
-      string rid(end + 1, request.size() - (end - request.c_str()));
+      string rid = request;
 
-      uint64_t current =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::system_clock::now().time_since_epoch())
-              .count();
       std::lock_guard<std::mutex> lock(graph_mutex_);
       // already initialized
-      if (timeout_ms == timeout_ && rid == requestid_) {
+      if (running_) {
         return;
       }
-      // no query running or previous query timed out
-      if (!running_ || current > timeout_ + 5000) {
-        std::cout << "Request INFO: " << request << "\n";
-        timeout_ = timeout_ms;
-        running_ = true;
-        requestid_ = rid;
-        totalSeg_ = segSize;
-      } else {
-        throw std::runtime_error("Another query running, abort..");
-      }
+      LOG(INFO) << "UDF updating " << request << " " << &graph_mutex_;
+      timeout_ = timeout_ms;
+      running_ = true;
+      requestid_ = rid;
+      totalSeg_ = segSize;
     }
     ResetGraph(totalSeg_);
     std::cout << "Graph INFO: " << vertices.size()
@@ -228,46 +185,28 @@ public:
       auto& source = s.second;
       auto& target = tgt.data_[s.first];
       auto& wei = weight.data_[s.first];
-      std::cout << "SEG " << std::to_string(s.first) << " " 
+      std::cout << "SEG " << std::to_string(s.first) << " "
 	        << std::to_string(source.size()) << "\n";
       if (source.size() != target.size() || target.size() != wei.size())
-	throw std::runtime_error("Edge has inconsistency, abort.."); 
-      for (int i=0; i<source.size(); ++i) 
+	throw std::runtime_error("Edge has inconsistency, abort..");
+      for (int i=0; i<source.size(); ++i)
         Fill(source.data_[i], target.data_[i], wei.data_[i]);
     }
-    std::cout << "Graph creation done \n";
-  }
-
-  void Clear(const EngineServiceRequest &request) {
-    {
-      std::lock_guard<std::mutex> lock(graph_mutex_);
-      if (!running_ || request.timeout_ts_ != timeout_ ||
-          request.requestid_.str() != requestid_) {
-        // Someone else already had access, likely
-        // due to this query already timed out
-        return;
+    // Fill missing vertices with no edges at the end
+    for (int segid = 0; segid < totalSeg_; ++segid) {
+      auto maxvid = max_vids_[segid];
+      if (wdata_[segid].offset_list_.size() < maxvid + 1) {
+        if (maxvid != 0) {
+          std::cout << "Expand segment " << std::to_string(segid)
+              << " " << std::to_string(wdata_[segid].offset_list_.size())
+              << " " << std::to_string(maxvid) << "\n";
+        }
+        size_t edge = wdata_[segid].adj_list_.size();
+        wdata_[segid].offset_list_.resize(maxvid + 1, edge);
+        wdata_[segid].weight_list_.resize(maxvid + 1, 0);
       }
-      ResetGraph(totalSeg_);
-      running_ = false;
     }
-  }
-
-  void Clear(const std::string &request) {
-    {
-      char *end;
-      int64_t timeout_ms = std::strtoll(request.c_str(), &end, 10);
-      int64_t segSize = std::strtoll(end, &end, 10);
-      string rid(end + 1, request.size() - (end - request.c_str()));
-      std::lock_guard<std::mutex> lock(graph_mutex_);
-      if (!running_ || timeout_ms != timeout_ || rid != requestid_) {
-        // Someone else already had access, likely
-        // due to this query already timed out
-        return;
-      }
-      ResetGraph(totalSeg_);
-      running_ = false;
-    }
-    std::cout << "Clear graph done\n";
+    std::cout << "Graph creation " << request << " done\n";
   }
 
   void ResetGraph(size_t segsize) {
@@ -276,7 +215,7 @@ public:
     wdata_.clear();
     wdata_.resize(segsize);
     max_vids_.clear();
-    max_vids_.resize(segsize);
+    max_vids_.resize(segsize, 0);
   }
 
   inline int64_t GetDegree(uint64_t src, bool weight) {
@@ -291,8 +230,11 @@ public:
 
   template <class Data>
   inline int64_t GetDegree(uint64_t segid, uint64_t localid, Data &data) {
-    if (localid >= data[segid].offset_list_.size())
-      return 0;
+    if (UNLIKELY(segid >= totalSeg_ || localid >= data[segid].offset_list_.size()))
+      throw std::runtime_error("Outdegree lookup error " + std::to_string(segid)
+	  + " " + std::to_string(localid)
+	  + " " + std::to_string(totalSeg_)
+	  + " " + std::to_string(data[segid].offset_list_.size()));
     return localid == 0 ? data[segid].offset_list_[localid]
                         : (data[segid].offset_list_[localid] -
                            data[segid].offset_list_[localid - 1]);
@@ -305,8 +247,11 @@ public:
   }
 
   inline float GetWeight(uint64_t segid, uint64_t localid) {
-    if (localid >= wdata_[segid].weight_list_.size())
-      return 0;
+    if (UNLIKELY(segid >= totalSeg_ || localid >= wdata_[segid].weight_list_.size()))
+      throw std::runtime_error("Weight lookup error " + std::to_string(segid)
+          + " " + std::to_string(localid)
+	  + " " + std::to_string(totalSeg_)
+          + " " + std::to_string(wdata_[segid].weight_list_.size()));
     return wdata_[segid].weight_list_[localid];
   }
 
@@ -319,7 +264,7 @@ public:
     uint64_t localid = v & SegmentMask;
     if (max_vids_[segid] < localid) {
       max_vids_[segid] = localid;
-    } 
+    }
   }
 
   inline void Fill(uint64_t src, uint64_t tgt) {
@@ -343,13 +288,30 @@ public:
     //      (x,y,z)(i,j)(k)
     // 0  0  3  0  2  1 (degree)
     // 0  0 1.4 0 0.8 0.4 (total weight)
+    // Note:
+    // Last few vertices in a segment may not have offset populated
+    // yet. To be filled at the end of InitializeGraph()
     uint32_t segid = src >> SegmentBits;
     uint32_t localid = src & SegmentMask;
+    if (UNLIKELY(segid >= totalSeg_ || localid > max_vids_[segid]))
+      throw std::runtime_error("Vertex too large "
+          + std::to_string(segid) + " " + std::to_string(localid)
+          + " " + std::to_string(totalSeg_)
+          + " " + std::to_string(max_vids_[segid]));
+
     if (wdata_[segid].offset_list_.size() <= localid) {
       size_t edge = wdata_[segid].adj_list_.size();
       wdata_[segid].offset_list_.resize(localid + 1, edge);
       wdata_[segid].weight_list_.resize(localid + 1, 0);
     }
+    uint32_t segid2 = tgt >> SegmentBits;
+    uint32_t localid2 = tgt & SegmentMask;
+    if (UNLIKELY(segid2 >= totalSeg_ || localid2 > max_vids_[segid2]))
+      throw std::runtime_error("Target vertex too large "
+          + std::to_string(segid2) + " " + std::to_string(localid2)
+          + " " + std::to_string(totalSeg_)
+          + " " + std::to_string(max_vids_[segid2]));
+
     wdata_[segid].offset_list_[localid]++;
     wdata_[segid].weight_list_[localid] += weight;
     wdata_[segid].adj_list_.push_back(std::make_pair(tgt, weight));
@@ -367,7 +329,7 @@ private:
   std::vector<SegmentCSR> data_;
   std::vector<WeightedSegmentCSR> wdata_;
   std::vector<uint32_t> max_vids_;
-  std::atomic<size_t> totalSeg_{10};
+  size_t totalSeg_ = 25000;
 };
 
 struct Compute {
@@ -385,16 +347,18 @@ struct PageRank {
 public:
   const static size_t thread_num_ = 1;
 
-  void InitializeCompute(Graph &graph) {
+  /* void InitializeCompute(Graph &graph) {
     graph_ = &graph;
     compute.clear();
     compute.resize(graph.GetSegSize());
     for (size_t i = 0; i < graph.GetSegSize(); ++i) {
       compute[i].rank_ =
-          std::make_unique<std::vector<float>>(graph.GetMaxVid(i) + 1, 1);
+	  std::unique_ptr<std::vector<float>>(
+	      new std::vector<float>(graph.GetMaxVid(i) + 1, 1));
       compute[i].current_ = compute[i].rank_.get();
       compute[i].rank2_ =
-          std::make_unique<std::vector<float>>(graph.GetMaxVid(i) + 1, 0);
+          std::unique_ptr<std::vector<float>>(
+              new std::vector<float>(graph.GetMaxVid(i) + 1, 0));
       compute[i].prior_ = compute[i].rank2_.get();
     }
   }
@@ -403,282 +367,188 @@ public:
     graph_ = &graph;
     compute.clear();
     compute.resize(graph.GetSegSize());
-    init_vertex_set_.resize(graph.GetSegSize());
     for (size_t i = 0; i < graph.GetSegSize(); ++i) {
       compute[i].rank_ =
-          std::make_unique<std::vector<float>>(graph.GetMaxVid(i) + 1, 0);
+          std::unique_ptr<std::vector<float>>(
+              new std::vector<float>(graph.GetMaxVid(i) + 1, 0));
       compute[i].current_ = compute[i].rank_.get();
       compute[i].rank2_ =
-          std::make_unique<std::vector<float>>(graph.GetMaxVid(i) + 1, 0);
+          std::unique_ptr<std::vector<float>>(
+              new std::vector<float>(graph.GetMaxVid(i) + 1, 0));
       compute[i].prior_ = compute[i].rank2_.get();
     }
     for (auto v : input.data_) {
       uint64_t segid = v >> SegmentBits;
       uint64_t localid = v & SegmentMask;
+      if (UNLIKELY(segid >= graph.GetSegSize())) {
+        throw std::runtime_error("Initializing vertex with large segment "
+	    + std::to_string(segid) + " " + std::to_string(localid)
+	    + " " + std::to_string(graph.GetSegSize()));
+      }
       if (compute[segid].rank_) {
-        // Just be cautious. This shouldn't happen.
-        if (localid >= compute[segid].rank_->size()) {
-          compute[segid].rank_->resize(localid + 1);
-          compute[segid].rank2_->resize(localid + 1);
+        if (UNLIKELY(localid >= compute[segid].rank_->size())) {
+           throw std::runtime_error("Initializing vertex does not exist "
+               + std::to_string(segid) + " " + std::to_string(localid)
+               + " " + std::to_string(compute[segid].rank_->size()));
         }
         compute[segid].rank_->at(localid) = 1;
-        init_set_.push_back(std::make_pair(segid, localid));
-        init_vertex_set_[segid].insert(localid);
+        start_set_.insert(v);
+      }
+    }
+  } */
+
+  void InitializeComputeSparse(Graph &graph, const ListAccum<uint64_t> &input) {
+    graph_ = &graph;
+    compute.clear();
+    compute.resize(graph.GetSegSize());
+    for (size_t i = 0; i < graph.GetSegSize(); ++i) {
+      if (graph.GetMaxVid(i) > 0) {
+        compute[i].rank_ =
+            std::unique_ptr<std::vector<float>>(
+                new std::vector<float>(graph.GetMaxVid(i) + 1, 0));
+        compute[i].current_ = compute[i].rank_.get();
+      }
+    }
+    for (auto v : input.data_) {
+      start_set_.insert(v);
+    }
+  }
+
+  void RunOneIterationSparse(bool weight, const ListAccum<uint64_t> &output_list, float damping) {
+    const auto &data = graph_->GetWeightedData();
+    for (uint64_t v : start_set_) {
+      uint64_t segid = v >> SegmentBits;
+      uint64_t localid = v & SegmentMask;
+      uint64_t ss = (localid == 0 ? 0 : data[segid].offset_list_[localid - 1]);
+      uint64_t ee = data[segid].offset_list_.at(localid);
+      float r = 1.0;
+      auto w = graph_->GetWeight(segid, localid);
+      if (ee > ss && r > 0 && w != 0) {
+        float rankbydegree = r / w;
+        for (uint64_t s = ss; s < ee; ++s) {
+          auto &vv = data[segid].adj_list_[s];
+          uint64_t segid2 = vv.first >> SegmentBits;
+          uint64_t localid2 = vv.first & SegmentMask;
+          (*compute[segid2].current_).at(localid2) += (vv.second * rankbydegree);
+          next_set_.insert(vv.first); 
+        }
+      }
+    }
+    for (auto& v : next_set_) {
+      uint64_t segid2 = v >> SegmentBits;
+      uint64_t localid2 = v & SegmentMask;
+      float val = (*compute[segid2].current_).at(localid2);
+      if (start_set_.find(v) != start_set_.end())
+        (*compute[segid2].current_).at(localid2) = (1 - damping) + damping * val;
+      else
+        (*compute[segid2].current_).at(localid2) = damping * val;
+    }
+    for (auto& v : start_set_) {
+      if (next_set_.find(v) == next_set_.end()) {
+        uint64_t segid2 = v >> SegmentBits;
+        uint64_t localid2 = v & SegmentMask;
+	(*compute[segid2].current_).at(localid2) = (1 - damping);
+        next_set_.insert(v);
       }
     }
   }
 
-  MapAccum<uint64_t, float> Retrieve(const ListAccum<uint64_t> &output_list) {
+  MapAccum<uint64_t, float> RunOneIterationFinal(bool weight, 
+						 const ListAccum<uint64_t> &output_list,
+						 float damping) {
     MapAccum<uint64_t, float> output;
-    for (auto &vid : output_list.data_) {
-      output.data_[vid] = GetRank(vid);
+    for (auto& v : output_list) output.data_[v] = 0; 
+    const auto &data = graph_->GetWeightedData();
+    for (uint64_t v : next_set_) {
+      uint64_t segid = v >> SegmentBits;
+      uint64_t localid = v & SegmentMask;
+      uint64_t ss = (localid == 0 ? 0 : data[segid].offset_list_[localid - 1]);
+      uint64_t ee = data[segid].offset_list_.at(localid);
+      auto r = (*compute[segid].current_).at(localid);
+      auto w = graph_->GetWeight(segid, localid);
+      if (ee > ss && r > 0 && w != 0) {
+        float rankbydegree = r / w;
+        for (uint64_t s = ss; s < ee; ++s) {
+          auto &vv = data[segid].adj_list_[s];
+          if (output.data_.find(vv.first) == output.data_.end()) continue;
+          output.data_[vv.first] += (vv.second * rankbydegree);     
+        }
+      }
+    }
+
+    for (auto& o : output.data_) {
+      if (o.second != 0) {
+        if (start_set_.find(o.first) != start_set_.end())
+          o.second = (1 - damping) + damping * o.second;
+        else
+          o.second = damping * o.second;     
+      } else {
+        uint64_t h = o.first >> SegmentBits;
+        uint64_t i = o.first & SegmentMask;
+        o.second = (*compute[h].current_).at(i);
+      }
     }
     return output;
-  }
-
-  void RunOneIteration(bool weight) {
-    if (weight) {
-      ProcessWeightedPageRank(ScheduleEdges(graph_->GetWeightedData()));
-    } else {
-      ProcessPageRank(ScheduleEdges(graph_->GetData()));
-    }
-  }
-
-  template <class Data>
-  std::vector<std::pair<uint64_t, uint64_t>> ScheduleEdges(const Data &data) {
-
-    // Assign edges to each thread
-    std::vector<std::pair<uint64_t, uint64_t>> assignment;
-    assignment.push_back(std::make_pair(
-        data.size() - 1, data[data.size() - 1].offset_list_.size() - 1));
-
-    /*    uint64_t beg =
-       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        int64_t total = 0;
-        for (size_t segid=0; segid<data.size(); ++segid) {
-          total += data[segid].adj_list_.size();
-        }
-        size_t segid = 0, sum = 0, avg = total / thread_num_, partial_seg = -1,
-       lastvid = -1; while (segid < data.size()) {
-          // First evaluate if the current_ segment can be all (or remaining
-       edges) included size_t remaining = data[segid].adj_list_.size(); if
-       (partial_seg == segid) { remaining = data[segid].adj_list_.size() *
-       (data[segid].offset_list_.size() - lastvid - 1) /
-       data[segid].offset_list_.size();
-          }
-          if (sum + remaining >= avg) {
-            // segment can provide edges that exceed average
-            int64_t partial = avg - sum;
-            int64_t split = partial * data[segid].offset_list_.size() /
-       data[segid].adj_list_.size(); if (split >=
-       data[segid].offset_list_.size()) { split =
-       data[segid].offset_list_.size() - 1;
-            }
-            std::cout << "Assignment " << segid << "|" << split << "|" <<
-       data[segid].offset_list_.size()
-                      << " edges " << partial << "|" <<
-       data[segid].adj_list_.size()
-                      << "|" << assignment.size() << "\n";
-            assignment.push_back(std::make_pair(segid, split));
-            sum = 0;
-            // Last thread left
-            if (assignment.size() == thread_num_ - 1) {
-              assignment.push_back(std::make_pair(data.size()-1,
-       data[data.size()-1].offset_list_.size()-1)); break;
-            }
-            if (split != data[segid].offset_list_.size() - 1) {
-              partial_seg = segid;
-              lastvid = split;
-            } else {
-              ++segid;
-            }
-          } else {
-            // take all the remaining edges;
-            sum += remaining;
-            ++segid;
-          }
-        }
-        if (assignment.size() < thread_num_) {
-          assignment.push_back(std::make_pair(data.size()-1,
-       data[data.size()-1].offset_list_.size()-1)); std::cout << "Assignment
-       last " << (data.size()-1) << "|"
-                    << (data[data.size()-1].offset_list_.size()-1) << "\n";
-        }
-
-        std::cout << "Prepare time " <<
-       (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
-       - beg) << " ms \n"; */
-    return assignment;
-  }
-
-  void ProcessPageRank(std::vector<std::pair<uint64_t, uint64_t>> assignment) {
-    const auto &data = graph_->GetData();
-    if (firstIter) {
-      // Optimize for first iteration
-//      uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-//                        std::chrono::system_clock::now().time_since_epoch())
-//                        .count();
-      uint64_t edges = 0;
-      for (auto &[segid, localid] : init_set_) {
-        uint64_t ss = (localid == 0 ? 0 : data[segid].offset_list_[localid - 1]);
-        uint64_t ee = data[segid].offset_list_[localid];
-        if (ee > ss) {
-          float rankbydegree =
-              (*compute[segid].current_)[localid] /
-              graph_->GetDegree(segid, localid, graph_->GetData());
-          for (uint64_t s = ss; s < ee; ++s) {
-            auto &v = data[segid].adj_list_[s];
-            edges++;
-            uint64_t segid2 = v >> SegmentBits;
-            uint64_t localid2 = v & SegmentMask;
-            compute[segid2].lock_->lock();
-            (*compute[segid2].prior_)[localid2] += rankbydegree;
-            compute[segid2].lock_->unlock();
-          }
-        }
-      }
-      firstIter = false;
-      // uint64_t t = std::chrono::duration_cast<std::chrono::milliseconds>(
-      //                 std::chrono::system_clock::now().time_since_epoch())
-      //                 .count() - ms;
-      //      std::cout << " Thread processed personalized weighted " << edges
-      //      << " in "
-      //                << t << " ms\n";
-      return;
-    }
-    //    omp_set_num_threads(std::min(thread_num_, assignment.size()));
-    // #pragma omp parallel
-    {
-      uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-      size_t id = 0; // omp_get_thread_num();
-      std::vector<std::vector<std::pair<uint64_t, float>>> thread_local_buffer(
-          graph_->GetSegSize());
-      size_t count = 0;
-      // when id == 0, start_localvid will be +1 in the loop
-      uint64_t start_segid = 0, start_localvid = -1, end_segid = -1,
-               end_localvid = -1;
-      if (id < assignment.size()) {
-        if (id != 0) {
-          start_segid = assignment[id - 1].first;
-          start_localvid = assignment[id - 1].second;
-        }
-        end_segid = assignment[id].first;
-        end_localvid = assignment[id].second;
-      }
-      size_t edges = 0;
-      float rankbydegree = 0;
-      for (auto segid = start_segid; segid <= end_segid; ++segid) {
-        if (data[segid].adj_list_.size() > 0) {
-          uint64_t start = 0, end = data[segid].offset_list_.size() - 1;
-          if (segid == start_segid)
-            start = start_localvid + 1; // exclusive
-          if (segid == end_segid)
-            end = end_localvid; // inclusive
-
-          for (auto localid = start; localid <= end; ++localid) {
-            uint64_t ss =
-                (localid == 0 ? 0 : data[segid].offset_list_[localid - 1]);
-            uint64_t ee = data[segid].offset_list_[localid];
-            if (ee > ss) {
-              rankbydegree =
-                  (*compute[segid].current_)[localid] /
-                  graph_->GetDegree(segid, localid, graph_->GetData());
-              for (uint64_t s = ss; s < ee; ++s) {
-                auto &v = data[segid].adj_list_[s];
-                edges++;
-                uint64_t segid2 = v >> SegmentBits;
-                uint64_t localid2 = v & SegmentMask;
-                thread_local_buffer[segid2].push_back(
-                    std::make_pair(localid2, rankbydegree));
-                if (++count >= 100000) {
-                  for (auto i = 0; i < thread_local_buffer.size(); ++i) {
-                    if (thread_local_buffer[i].size() > 0) {
-                      compute[i].lock_->lock();
-                      for (auto &pair : thread_local_buffer[i]) {
-                        (*compute[i].prior_)[pair.first] += pair.second;
-                      }
-                      compute[i].lock_->unlock();
-                      thread_local_buffer[i].clear();
-                    }
-                  }
-                  count = 0;
-                }
-              }
-            }
-          }
-        }
-      }
-      for (auto i = 0; i < thread_local_buffer.size(); ++i) {
-        if (thread_local_buffer[i].size() > 0) {
-          compute[i].lock_->lock();
-          for (auto &pair : thread_local_buffer[i]) {
-            (*compute[i].prior_)[pair.first] += pair.second;
-          }
-          compute[i].lock_->unlock();
-          thread_local_buffer[i].clear();
-        }
-      }
-      // uint64_t t = std::chrono::duration_cast<std::chrono::milliseconds>(
-      //                 std::chrono::system_clock::now().time_since_epoch())
-      //                 .count() - ms;
-      //      std::cout << " Thread " << id << " processed unweight " << edges
-      //      << " in "
-      //                << t << " ms\n";
-    }
   }
 
   void
   ProcessWeightedPageRank(std::vector<std::pair<uint64_t, uint64_t>> assignment) {
     const auto &data = graph_->GetWeightedData();
-    if (firstIter) {
+    if (sparse_) {
       // Optimize for first iteration
-      uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-      uint64_t edges = 0;
-      for (auto &[segid, localid] : init_set_) {
+      // uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      //                  std::chrono::system_clock::now().time_since_epoch())
+      //                  .count();
+      // uint64_t edges = 0;
+      for (uint64_t v : start_set_) {
+        uint64_t segid = v >> SegmentBits;
+        uint64_t localid = v & SegmentMask;        
+      //  if (UNLIKELY(segid >= data.size() ||
+      //      localid >= data[segid].offset_list_.size())) {
+      //    throw std::runtime_error("First iteration src error " + std::to_string(segid)
+      //        + " " + std::to_string(localid)
+      //        + " " + std::to_string(data.size())
+      //        + " " + std::to_string(data[segid].offset_list_.size()));          
+      //  }
         uint64_t ss = (localid == 0 ? 0 : data[segid].offset_list_[localid - 1]);
-        uint64_t ee = data[segid].offset_list_[localid];
-        auto r = (*compute[segid].current_)[localid];
+        uint64_t ee = data[segid].offset_list_.at(localid);
+        auto r = (*compute[segid].current_).at(localid);
         auto w = graph_->GetWeight(segid, localid);
         if (ee > ss && r > 0 && w != 0) {
           float rankbydegree = r / w;
           for (uint64_t s = ss; s < ee; ++s) {
             auto &v = data[segid].adj_list_[s];
-            edges++;
             uint64_t segid2 = v.first >> SegmentBits;
             uint64_t localid2 = v.first & SegmentMask;
-            compute[segid2].lock_->lock();
-            (*compute[segid2].prior_)[localid2] += v.second * rankbydegree;
-            compute[segid2].lock_->unlock();
+      //      if (UNLIKELY(segid2 >= data.size() ||
+      //          localid2 >= data[segid2].offset_list_.size())) {
+      //        throw std::runtime_error("First iteration tgt error " + std::to_string(segid2)
+      //            + " " + std::to_string(localid2)
+      //            + " " + std::to_string(data.size())
+      //            + " " + std::to_string(data[segid2].offset_list_.size()));
+      //      }
+//          compute[segid2].lock_->lock();
+            (*compute[segid2].prior_).at(localid2) += (v.second * rankbydegree);
+	    next_set_.insert(v.first);
+//          compute[segid2].lock_->unlock();
           }
         }
       }
-      firstIter = false;
-      // uint64_t t = std::chrono::duration_cast<std::chrono::milliseconds>(
-      //                 std::chrono::system_clock::now().time_since_epoch())
-      //                 .count() - ms;
-      //      std::cout << " Thread processed personalized weighted " << edges
-      //      << " in "
-      //                << t << " ms\n";
       return;
     }
 
-    //    omp_set_num_threads(std::min(thread_num_, assignment.size()));
-    //    #pragma omp parallel
+    // #pragma omp parallel
     {
-      uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
+      // uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      //                  std::chrono::system_clock::now().time_since_epoch())
+      //                  .count();
       size_t id = 0; // omp_get_thread_num();
       std::vector<std::vector<std::pair<uint64_t, float>>> thread_local_buffer(
           graph_->GetSegSize());
       size_t count = 0;
       // when id == 0, start_localvid will be +1 in the loop
-      uint64_t start_segid = 0, start_localvid = -1, end_segid = -1,
-               end_localvid = -1;
+      int64_t start_segid = 0, start_localvid = -1, end_segid = -1,
+              end_localvid = -1;
       if (id < assignment.size()) {
         if (id != 0) {
           start_segid = assignment[id - 1].first;
@@ -691,35 +561,49 @@ public:
       float rankbydegree = 0;
       for (auto segid = start_segid; segid <= end_segid; ++segid) {
         if (data[segid].adj_list_.size() > 0) {
-          uint64_t start = 0, end = data[segid].offset_list_.size() - 1;
+          int64_t start = 0, end = data[segid].offset_list_.size() - 1;
           if (segid == start_segid)
             start = start_localvid + 1; // exclusive
           if (segid == end_segid)
             end = end_localvid; // inclusive
 
           for (auto localid = start; localid <= end; ++localid) {
+//            if (UNLIKELY(segid >= data.size() ||
+//                localid >= data[segid].offset_list_.size())) {
+//              throw std::runtime_error("Iteration src error " + std::to_string(segid)
+//                  + " " + std::to_string(localid)
+//                  + " " + std::to_string(data.size())
+//                  + " " + std::to_string(data[segid].offset_list_.size()));
+//            }
             uint64_t ss =
                 (localid == 0 ? 0 : data[segid].offset_list_[localid - 1]);
-            uint64_t ee = data[segid].offset_list_[localid];
-            auto r = (*compute[segid].current_)[localid];
+            uint64_t ee = data[segid].offset_list_.at(localid);
+            auto r = (*compute[segid].current_).at(localid);
             auto w = graph_->GetWeight(segid, localid);
             if (ee > ss && r > 0 && w != 0) {
               rankbydegree = r / w;
               for (uint64_t s = ss; s < ee; ++s) {
-                auto &v = data[segid].adj_list_[s];
-                edges++;
+                auto &v = data[segid].adj_list_.at(s);
+                // edges++;
                 uint64_t segid2 = v.first >> SegmentBits;
                 uint64_t localid2 = v.first & SegmentMask;
+  //              if (UNLIKELY(segid2 >= data.size() ||
+  //                  localid2 >= data[segid2].offset_list_.size())) {
+  //                throw std::runtime_error("Iteration tgt error " + std::to_string(segid2)
+  //                    + " " + std::to_string(localid2)
+  //                    + " " + std::to_string(data.size())
+  //                    + " " + std::to_string(data[segid2].offset_list_.size()));
+  //              }
                 thread_local_buffer[segid2].push_back(
                     std::make_pair(localid2, v.second * rankbydegree));
                 if (++count >= 100000) {
                   for (auto i = 0; i < thread_local_buffer.size(); ++i) {
                     if (thread_local_buffer[i].size() > 0) {
-                      compute[i].lock_->lock();
+//                      compute[i].lock_->lock();
                       for (auto &pair : thread_local_buffer[i]) {
-                        (*compute[i].prior_)[pair.first] += pair.second;
+                        (*compute[i].prior_).at(pair.first) += pair.second;
                       }
-                      compute[i].lock_->unlock();
+//                      compute[i].lock_->unlock();
                       thread_local_buffer[i].clear();
                     }
                   }
@@ -732,88 +616,72 @@ public:
       }
       for (auto i = 0; i < thread_local_buffer.size(); ++i) {
         if (thread_local_buffer[i].size() > 0) {
-          compute[i].lock_->lock();
+//          compute[i].lock_->lock();
           for (auto &pair : thread_local_buffer[i]) {
-            (*compute[i].prior_)[pair.first] += pair.second;
+            (*compute[i].prior_).at(pair.first) += pair.second;
           }
-          compute[i].lock_->unlock();
+//          compute[i].lock_->unlock();
           thread_local_buffer[i].clear();
         }
       }
-      // uint64_t t = std::chrono::duration_cast<std::chrono::milliseconds>(
-      //                 std::chrono::system_clock::now().time_since_epoch())
-      //                 .count() - ms;
-      //      std::cout << " Thread " << id << " processed " << edges << " in "
-      //      << t
-      //                << " ms\n";
     }
   }
 
-  bool FinishOneIteration(float damping, float maxChange) {
+/*  bool FinishOnePersonalizedPRIteration(float damping, float maxChange) {
     bool finish = true;
-    {
-      //    omp_set_num_threads(thread_num_);
-      //  #pragma omp parallel for schedule(static, 10)
-      for (size_t h = 0; h < compute.size(); ++h) {
-        auto &d = compute[h];
-        if (d.prior_) {
-          for (size_t i = 0; i < d.prior_->size(); ++i) {
-            float &p = (*d.prior_)[i], &c = (*d.current_)[i];
+    for (auto& v : next_set_) {
+      uint64_t h = v >> SegmentBits;
+      uint64_t i = v & SegmentMask;
+      auto &d = compute[h];
+      if (d.prior_) {
+        float &p = (*d.prior_).at(i), &c = (*d.current_).at(i);
+        if (p != 0) {
+          if (init_vertex_set_.find(v) != init_vertex_set_.end())
             p = (1 - damping) + damping * p;
-            if (finish && abs(p - c) > maxChange) {
-              finish = false;
-            }
-            c = 0;
-          }
-          std::swap(d.prior_, d.current_);
+          else
+            p = damping * p;
+//          if (finish && abs(p - c) > maxChange) {
+//            finish = false;
+//          }
+        } else if (c != 0) {
+          p = 1 - damping;
+        }
+        c = 0;
+      }
+    }
+    for (auto& v : init_vertex_set_) {
+      uint64_t h = v >> SegmentBits;
+      uint64_t i = v & SegmentMask;
+      auto &d = compute[h];
+      if (d.prior_) {
+        float &p = (*d.prior_).at(i), &c = (*d.current_).at(i);
+        if (p == 0 && c != 0) {
+          p = 1 - damping;
+          c = 0;
         }
       }
     }
-    return finish;
-  }
-
-  bool FinishOnePersonalizedPRIteration(float damping, float maxChange) {
-    bool finish = true;
-    {
-      //    omp_set_num_threads(thread_num_);
-      // #pragma omp parallel for schedule(static, 10)
-      for (size_t h = 0; h < compute.size(); ++h) {
-        auto &d = compute[h];
-        if (d.prior_) {
-          for (size_t i = 0; i < d.prior_->size(); ++i) {
-            float &p = (*d.prior_)[i], &c = (*d.current_)[i];
-            if (p != 0) {
-              if (init_vertex_set_[h].find(i) != init_vertex_set_[h].end())
-                p = (1 - damping) + damping * p;
-              else
-                p = damping * p;
-              if (finish && abs(p - c) > maxChange) {
-                finish = false;
-              }
-            } else if (c != 0 && init_vertex_set_[h].find(i) !=
-                                 init_vertex_set_[h].end()) {
-              p = 1 - damping;
-            }
-            c = 0;
-          }
-          std::swap(d.prior_, d.current_);
-        }
-      }
+    for (auto& comp : compute) {
+      std::swap(comp.prior_, comp.current_);
     }
+    LOG(INFO) << "Finish one iteration " << start_set_.size() 
+        << " " << next_set_.size(); 
+    start_set_.swap(next_set_);
+    next_set_.clear();
     return finish;
   }
 
   float GetRank(uint64_t vid) {
     auto segid = vid >> SegmentBits;
     auto localid = vid & SegmentMask;
-    return (*compute[segid].current_)[localid];
+    return (*compute[segid].current_).at(localid);
   }
-
+*/
 private:
   std::vector<Compute> compute; // per segment
-  std::vector<std::pair<uint64_t, uint64_t>> init_set_;
-  std::vector<std::unordered_set<uint32_t>> init_vertex_set_;
-  bool firstIter = true;
+  std::unordered_set<uint64_t> start_set_;
+  std::unordered_set<uint64_t> next_set_;
+  bool sparse_ = true;
   Graph *graph_;
 };
 
